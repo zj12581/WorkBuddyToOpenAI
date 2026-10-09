@@ -1,0 +1,13 @@
+{
+  "name": "dsh-plugin-workbuddy-models",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Keep the DeepSeek Harness workbuddy provider's model list in sync with the gateway",
+  "type": "module",
+  "main": "lib/index.js",
+  "dsh": {
+    "plugin": {
+      "name": "workbuddy-models"
+    }
+  }
+}

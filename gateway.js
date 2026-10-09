@@ -37,9 +37,10 @@ const {
   buildUpstreamBody, isBlockPayload, StreamAccumulator,
   makeChunk, makeUsageChunk, SSE_DONE, sseFrame, countZeroWidth,
   sessionIdFromHeaders, resolveConversationId,
-  modelLimits,
+  modelLimits, MODEL_LIMITS,
 } = require('./lib/core');
 const { Credential } = require('./lib/credentials');
+const catalog = require('./lib/catalog');
 
 // ---------------------------------------------------------------------------
 // Configuration: defaults, then the config file, then CLI flags / environment
@@ -163,6 +164,114 @@ function modelTier(id) {
   return 'unknown';
 }
 
+// ---------------------------------------------------------------------------
+// Live model registry
+// ---------------------------------------------------------------------------
+//
+// The lists above are a snapshot. The upstream publishes new ids and retires old
+// ones without notice, so the served list is built by merging the snapshot with
+// the upstream catalog at startup and on an interval. `MODELS` is the merged
+// result; `/v1/models` and the usage log both read from it.
+//
+// When the catalog cannot be reached, the last good result is loaded from disk,
+// and failing that the snapshot is used. The gateway therefore always has a list
+// — a network failure degrades the list, it does not empty it.
+
+let MODELS = DEFAULT_MODELS.map(id => ({ id, tier: modelTier(id), ...modelLimits(id), source: 'curated' }));
+
+/** Look up the merged entry for an id. */
+function modelEntry(id) {
+  return MODELS.find(m => m.id === id) || null;
+}
+
+/** The ids in served order. */
+function modelIds() {
+  return MODELS.map(m => m.id);
+}
+
+/** Context/output limits for an id, from the merged entry. */
+function liveLimits(id) {
+  const entry = modelEntry(id);
+  if (entry) return { contextWindow: entry.contextWindow, maxOutputTokens: entry.maxOutputTokens };
+  return modelLimits(id);
+}
+
+/**
+ * Rebuild MODELS from the curated lists plus the upstream catalog.
+ * Never throws: on any failure the previous list stays in place.
+ */
+async function refreshModelCatalog(cred, options) {
+  const opts = options || {};
+  const silent = opts.silent === true;
+
+  let session = null;
+  try {
+    session = cred ? cred.auth() : null;
+  } catch { /* no credential yet: fall back to cache/snapshot below */ }
+
+  let fetched = { models: new Map(), error: 'no credential available' };
+  if (session && session.accessToken) {
+    fetched = await catalog.fetchCatalog({
+      token: session.accessToken,
+      uid: session.uid,
+      domain: session.domain,
+      upstream: CONFIG.upstream,
+    });
+  }
+
+  const merged = catalog.mergeCatalog({
+    // A user-supplied list wins outright: it is an explicit instruction, so the
+    // catalog is not consulted for additions at all in that case.
+    curated: CONFIG.explicitModelList || DEFAULT_MODELS,
+    catalog: fetched.models,
+    limits: (id) => modelLimits(id),
+    tierOf: (id) => modelTier(id),
+    defaultContext: catalog.DEFAULT_CONTEXT_TOKENS,
+    defaultOutput: catalog.DEFAULT_OUTPUT_TOKENS,
+  });
+
+  if (fetched.error) {
+    // Prefer the last good catalog over silently shrinking the list.
+    const cached = catalog.readCache(CONFIG.catalogCacheFile);
+    if (cached && cached.length) {
+      MODELS = cached;
+      if (!silent) log('catalog   : fetch failed (' + fetched.error + '), using cached list of ' + cached.length + ' models');
+      return MODELS;
+    }
+    if (!silent) log('catalog   : fetch failed (' + fetched.error + '), using the built-in list of ' + merged.length + ' models');
+    MODELS = merged;
+    return MODELS;
+  }
+
+  const added = merged.filter(m => m.source === 'catalog');
+  MODELS = merged;
+  catalog.writeCache(CONFIG.catalogCacheFile, merged);
+
+  if (!silent) {
+    log('catalog   : ' + fetched.models.size + ' upstream, serving ' + merged.length
+      + (added.length ? ' (+' + added.length + ' new: ' + added.map(m => m.id).join(', ') + ')' : ''));
+  }
+  return MODELS;
+}
+
+/** Start periodic catalog refreshes. Returns a stop function. */
+function startCatalogRefresh(cred) {
+  if (CONFIG.catalogRefreshMs <= 0) return () => {};
+
+  const tick = () => {
+    refreshModelCatalog(cred, { silent: false })
+      .catch(e => log('catalog   : refresh error: ' + (e && e.message ? e.message : e)));
+  };
+
+  // Delay the first refresh slightly so startup (and its log banner) is not
+  // blocked on the network; the curated list already serves requests by then.
+  const first = setTimeout(tick, 1500);
+  const timer = setInterval(tick, CONFIG.catalogRefreshMs);
+  if (typeof timer.unref === 'function') timer.unref();
+
+  return () => { clearTimeout(first); clearInterval(timer); };
+}
+
 const CONFIG = {
   host: pick(args.host, process.env.WORKBUDDY_GATEWAY_HOST, fileConfig.host, '127.0.0.1'),
   port: Number(pick(args.port, process.env.WORKBUDDY_GATEWAY_PORT, fileConfig.port, 8790)),
@@ -182,6 +291,29 @@ const CONFIG = {
     return DEFAULT_MODELS;
   })(),
 };
+
+// Whether the user pinned the model list. When they did, the upstream catalog is
+// not consulted for additions — an explicit list is an instruction, not a seed.
+CONFIG.explicitModelList = (() => {
+  const raw = pick(args['model-list'], process.env.WORKBUDDY_MODELS, fileConfig.models);
+  if (Array.isArray(raw)) return raw.map(s => String(s).trim()).filter(Boolean);
+  if (typeof raw === 'string') return raw.split(',').map(s => s.trim()).filter(Boolean);
+  return null;
+})();
+
+// Catalog refresh interval in ms. 0 disables it (serving only the built-in list).
+CONFIG.catalogRefreshMs = Number(pick(
+  args['catalog-refresh'],
+  process.env.WORKBUDDY_CATALOG_REFRESH,
+  fileConfig.catalogRefreshMs,
+  6 * 60 * 60 * 1000,
+));
+// Where the last good merged list is kept, so a restart with no network still
+// serves the full list.
+CONFIG.catalogCacheFile = pick(
+  fileConfig.catalogCacheFile,
+  path.join(path.dirname(CONFIG.logFile || DEFAULT_CONFIG_FILE), 'models-cache.json'),
+);
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -243,6 +375,9 @@ function readBody(req) {
 // ---------------------------------------------------------------------------
 
 let credential = null;
+
+/** Stops the periodic catalog refresh; replaced once startup reaches it. */
+let stopCatalogRefresh = () => {};
 
 /** Paid models already warned about, so the log is not flooded. */
 const warnedPaid = new Set();
@@ -481,7 +616,7 @@ const server = http.createServer(async (req, res) => {
         service: 'workbuddy-gateway',
         upstream: CONFIG.upstream,
         node: process.version,
-        models: CONFIG.models,
+        models: modelIds(),
         desensitize: CONFIG.desensitize,
         retryOnBlock: CONFIG.retryOnBlock,
         credential: cred,
@@ -492,16 +627,22 @@ const server = http.createServer(async (req, res) => {
       if (!checkAuth(req)) return sendJson(res, 401, openaiError('invalid api key', 'auth_error', 401));
       return sendJson(res, 200, {
         object: 'list',
-        data: CONFIG.models.map(id => ({
-          id,
+        // Served from the merged registry: the curated list plus whatever the
+        // upstream catalog currently offers (see refreshModelCatalog).
+        data: MODELS.map(m => ({
+          id: m.id,
           object: 'model',
           created: 1700000000,
           owned_by: 'workbuddy',
           // measured: free = credit is always 0, paid = billed per request
-          tier: modelTier(id),
+          tier: m.tier,
           // Context and output caps, so a client does not have to hardcode one
           // value for every model. null means "not measured", not "unlimited".
-          ...modelLimits(id),
+          contextWindow: m.contextWindow,
+          maxOutputTokens: m.maxOutputTokens,
+          // "catalog" marks ids that came from the live upstream list rather than
+          // the built-in snapshot, which makes a newly published model visible.
+          source: m.source,
         })),
       });
     }
@@ -565,16 +706,27 @@ function main() {
   log('auth file : ' + s.file);
   log('account   : domain=' + s.domain
     + (s.token_expired ? ' | token expired (will refresh)' : ' | token valid to ' + s.token_expires_at));
-  log('free models : ' + CONFIG.models.filter(m => modelTier(m) === 'free').join(', '));
-  log('paid models : ' + CONFIG.models.filter(m => modelTier(m) === 'paid').join(', '));
+  log('free models : ' + MODELS.filter(m => m.tier === 'free').map(m => m.id).join(', '));
+  log('paid models : ' + MODELS.filter(m => m.tier === 'paid').map(m => m.id).join(', '));
+  if (MODELS.some(m => m.source === 'catalog')) {
+    log('from catalog: ' + MODELS.filter(m => m.source === 'catalog').map(m => m.id).join(', '));
+  }
+  log('catalog   : ' + (CONFIG.catalogRefreshMs > 0
+    ? 'refresh every ' + Math.round(CONFIG.catalogRefreshMs / 60000) + ' min'
+    : 'disabled (serving the built-in list)'));
   log('filter    : desensitize=' + (CONFIG.desensitize ? 'on' : 'off') + ' blockRetry=' + (CONFIG.retryOnBlock ? 'on' : 'off'));
   log('auth      : ' + (CONFIG.apiKey ? 'api key required' : 'no api key (local use only)'));
   log('listening : http://' + CONFIG.host + ':' + CONFIG.port);
 
+  // Merge the upstream catalog in the background, started after the banner so
+  // startup never blocks on the network: the built-in list already serves
+  // requests, and the merge announces itself on its own log line when it lands.
+  stopCatalogRefresh = startCatalogRefresh(credential);
+
   server.listen(CONFIG.port, CONFIG.host, () => log('ready. Ctrl+C to exit.'));
   server.on('error', (e) => { log('listen failed: ' + e.message); process.exit(1); });
-  process.on('SIGINT', () => { log('bye'); process.exit(0); });
-  process.on('SIGTERM', () => { log('bye'); process.exit(0); });
+  process.on('SIGINT', () => { stopCatalogRefresh(); log('bye'); process.exit(0); });
+  process.on('SIGTERM', () => { stopCatalogRefresh(); log('bye'); process.exit(0); });
 }
 
 main();
