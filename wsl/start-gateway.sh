@@ -99,10 +99,18 @@ else
       */Users/Public/*|*/Users/Default/*|*/Users/Default\ User/*|*/Users/All\ Users/*) continue ;;
     esac
     if [ -d "$dir" ]; then
-      # prefer a file named for workbuddy, else any .info
-      for f in "$dir"/workbuddy*.info "$dir"/*.info; do
-        [ -r "$f" ] && WIN_AUTH="$f" && break
-      done
+      # Prefer the live session file `workbuddy-desktop.info` (no timestamp
+      # suffix) — that is the one the desktop client keeps writing. Only fall
+      # back to timestamped snapshots when the live file is absent. The old
+      # naive glob `workbuddy*.info` sorted the timestamped snapshots ahead of
+      # the live file, so WSL could pick a stale session from a different
+      # account and every request was rejected with 11140 "request illegal".
+      if [ -r "$dir/workbuddy-desktop.info" ]; then
+        WIN_AUTH="$dir/workbuddy-desktop.info"
+      else
+        # Newest .info by mtime (most recently refreshed session).
+        WIN_AUTH="$(ls -1t "$dir"/*.info 2>/dev/null | head -n 1)"
+      fi
     fi
     [ -n "$WIN_AUTH" ] && break
   done
