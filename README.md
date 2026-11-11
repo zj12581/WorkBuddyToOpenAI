@@ -224,7 +224,7 @@ Any client that speaks the OpenAI chat protocol works. You need three values:
 Before choosing a model:
 
 1. **Start with `deepseek-v4-flash`.** It measured `credit: 0` and does not spend its output budget on reasoning.
-2. **Measure "free" on your own account.** Free/paid does not follow the multiplier and changes over time. See [What actually drives the bill](#what-actually-drives-the-bill); read `credit=` from the gateway log (`--debug`) instead of trusting any table, including the one below.
+2. **Measure "free" on your own account.** Free/paid does not follow the multiplier and changes over time. See [What actually drives the bill](#what-else-drives-the-bill); read `credit=` from the gateway log (`--debug`) instead of trusting any table, including the one below.
 
 ---
 
@@ -281,23 +281,41 @@ The two usual fixes are unavailable on many machines:
 | WSL mirrored networking (`networkingMode=mirrored`) | Windows 11 22H2+ — **not** Windows 10 |
 | `netsh interface portproxy` | Administrator rights, and the WSL IP changes across reboots |
 
-The supported answer is a **second gateway instance inside WSL** that reads the Windows login through `/mnt/c`. The Windows-side gateway keeps its loopback binding and is never touched:
+Run **one gateway inside WSL** that reads the Windows login through `/mnt/c`. WSL apps use its loopback address; Windows apps can use Windows `127.0.0.1` when WSL localhost forwarding is enabled:
 
 ```bash
-bash wsl/start-gateway.sh     # starts on 127.0.0.1:8791 inside the VM
+bash wsl/start-gateway.sh     # starts on 127.0.0.1:8790 inside WSL
 bash wsl/stop-gateway.sh      # stops it
 
 bash wsl/install-extension.sh # install the extension into the WSL extension host
 ```
 
-You end up with two side-by-side instances, which is intentional:
+One instance serves both environments:
 
 ```
-127.0.0.1:8790   Windows   ← used by Windows apps (DeepSeek Harness, Windows VS Code)
-127.0.0.1:8791   WSL       ← used by VS Code attached to WSL
+127.0.0.1:8790   WSL gateway ← WSL apps; Windows apps via localhost forwarding
 ```
 
-The extension probes `8791` automatically, so no URL configuration is needed.
+The extension probes `8790` by default. Stop any old Windows gateway on the same port first, or Windows clients may reach that instance instead. Verify `http://127.0.0.1:8790/health` from Windows; check WSL configuration if localhost forwarding is unavailable. Set `WORKBUDDY_WSL_PORT` for a custom port and use the same variable or `--port` when stopping it.
+
+### One gateway, many clients
+
+The gateway is a single HTTP endpoint, so every client on the machine points at the same `127.0.0.1:8790` and they share one login session and one credit balance. That is the intended shape — running several gateways side by side only splits the session file between them and makes it unclear which one is spending credits.
+
+```
+                     ┌─────────────────────────────┐
+  DeepSeek Harness ──┤                             │
+  VS Code (Win/WSL)──┤  127.0.0.1:8790             ├── copilot.tencent.com
+  bots / scripts  ───┤  one gateway.js process     │
+                     └─────────────────────────────┘
+```
+
+What that means in practice:
+
+- **Only one process** should listen on the port. If two exist, whichever bound first answers, and the other silently never receives traffic. `wsl/stop-gateway.sh` stops every in-WSL instance, and `start-gateway.sh` refuses to add a second one on the same port.
+- **The port is the only thing clients need to agree on.** `GET /v1/models` tells them what is available, including context windows, so nothing else has to be configured per client.
+- **Model lists in clients drift; the gateway does not.** It tracks the upstream catalog on its own, while DSH and similar clients keep an explicit list in their own config. `integrations/dsh/sync-models.js` copies the gateway's list into DSH.
+- **Windows↔WSL is handled by WSL itself.** With localhost forwarding on (the default), a gateway bound to loopback inside WSL is reachable from Windows as `127.0.0.1:8790`; `wslrelay.exe` does the forwarding. If that stops working, check `wsl --shutdown` then restart the gateway before reaching for a second instance.
 
 ### Requirements inside WSL
 
@@ -527,7 +545,7 @@ lib/core.js                pure logic: desensitization, request building, SSE pa
 lib/credentials.js         session discovery, token refresh, upstream headers
 scripts/setup.{ps1,sh}     one-command install
 scripts/stop.{ps1,sh}      stop the gateway
-wsl/start-gateway.sh       a second instance for use inside WSL (port 8791)
+wsl/start-gateway.sh       loopback gateway inside WSL (default port 8790)
 wsl/stop-gateway.sh        stop it
 wsl/install-extension.sh   install the extension into the WSL extension host
 vscode-extension/          VS Code integration (model provider + standalone panel)

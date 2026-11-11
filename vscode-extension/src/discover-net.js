@@ -60,13 +60,10 @@ function wslHostAddress() {
 /**
  * Port a gateway instance started inside WSL listens on by default.
  *
- * WSL (NAT mode) cannot reach a gateway bound to Windows loopback, and on
- * Windows 10 neither mirrored networking nor portproxy is available. The
- * supported workaround is a second gateway instance running inside WSL that reads
- * the Windows auth file through /mnt/c — it uses its own port so the Windows-side
- * gateway is left untouched.
+ * A loopback-only gateway inside WSL can also serve Windows via WSL localhost
+ * forwarding when enabled. Its port remains configurable.
  */
-const WSL_LOCAL_PORT = 8791;
+const WSL_LOCAL_PORT = 8790;
 
 /**
  * Ordered list of URLs to try.
@@ -84,8 +81,7 @@ function gatewayUrlCandidates(configured, port) {
     // Inside WSL: loopback is the VM, so a gateway started *here* answers on it.
     push('http://127.0.0.1:' + p);
     push('http://localhost:' + p);
-    // Same, on the conventional in-WSL port, for when the setting still points
-    // at the Windows gateway's 8790.
+    // Also try the default WSL port if a custom URL is configured.
     if (p !== WSL_LOCAL_PORT) {
       push('http://127.0.0.1:' + WSL_LOCAL_PORT);
       push('http://localhost:' + WSL_LOCAL_PORT);

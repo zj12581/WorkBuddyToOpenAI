@@ -283,23 +283,41 @@ WSL 在 NAT 模式下有**自己的** `127.0.0.1`,那不是 Windows 的 loopback
 | WSL 镜像网络(`networkingMode=mirrored`) | Windows 11 22H2+ —— **Windows 10 没有** |
 | `netsh interface portproxy` | 需要管理员权限,而且 WSL 的 IP 每次重启会变 |
 
-真正的办法是在 **WSL 里再跑一个网关实例**,通过 `/mnt/c` 读 Windows 那份登录态。Windows 侧的网关保持 loopback 绑定,完全不动:
+推荐在 **WSL 内运行一个网关**,通过 `/mnt/c` 读取 Windows 登录态。WSL 应用访问自己的 loopback；启用 WSL localhost 转发时，Windows 应用也可以通过 Windows 的 `127.0.0.1` 访问它。
 
 ```bash
-bash wsl/start-gateway.sh     # 在虚拟机内起在 127.0.0.1:8791
+bash wsl/start-gateway.sh     # 在 WSL 内监听 127.0.0.1:8790
 bash wsl/stop-gateway.sh      # 停掉
 
 bash wsl/install-extension.sh # 把扩展装进 WSL 的扩展宿主
 ```
 
-最后会有两个实例并存,这是有意的:
+只需一个实例：
 
 ```
-127.0.0.1:8790   Windows   ← Windows 侧应用用(DeepSeek Harness、Windows 版 VS Code)
-127.0.0.1:8791   WSL       ← 连 WSL 的 VS Code 用
+127.0.0.1:8790   WSL 网关 ← WSL 应用；Windows 应用通过 localhost 转发访问
 ```
 
-扩展会自动探测 `8791`,不用配地址。
+扩展默认探测 `8790`。先停止 Windows 上相同端口的旧网关，否则 Windows 客户端可能连接到旧实例。Windows 侧请验证 `http://127.0.0.1:8790/health`；localhost 转发不可用时需要检查 WSL 配置。自定义端口可设置 `WORKBUDDY_WSL_PORT`，停止时使用相同变量或 `--port`。
+
+### 一个网关，多个客户端
+
+网关就是一个 HTTP 接口，所以本机所有客户端都指向同一个 `127.0.0.1:8790`，共用一份登录会话和一份额度。这是设计意图 —— 同时跑几个网关只会把会话文件拆开，而且分不清到底是谁在扣积分。
+
+```
+                     ┌─────────────────────────────┐
+  DeepSeek Harness ──┤                             │
+  VS Code(Win/WSL)──┤  127.0.0.1:8790             ├── copilot.tencent.com
+  机器人 / 脚本   ───┤  一个 gateway.js 进程        │
+                     └─────────────────────────────┘
+```
+
+实际意味着:
+
+- **端口上只能有一个进程。** 有两个时，先绑上那个接管流量，另一个静默收不到请求。`wsl/stop-gateway.sh` 会停掉 WSL 内全部实例，`start-gateway.sh` 拒绝在同一端口再加一个。
+- **客户端唯一要对齐的就是端口。** `GET /v1/models` 会给出可用模型和上下文长度，不需要为每个客户端单独配别的。
+- **客户端里的模型清单会漂移，网关不会。** 网关自己跟踪上游目录，而 DSH 这类客户端把清单写在各自配置里。`integrations/dsh/sync-models.js` 负责把网关的清单同步过去。
+- **Windows↔WSL 由 WSL 自己处理。** 开启 localhost 转发(默认开启)后，绑在 WSL 内 loopback 的网关在 Windows 上就是 `127.0.0.1:8790`，由 `wslrelay.exe` 转发。这条不通时，先 `wsl --shutdown` 再重启网关，不要急着再起一个实例。
 
 ### WSL 里的前提
 
@@ -530,7 +548,7 @@ lib/core.js                纯逻辑:脱敏、请求构造、SSE 解析
 lib/credentials.js         登录态定位、token 续期、上游请求头
 scripts/setup.{ps1,sh}     一键安装
 scripts/stop.{ps1,sh}      停止网关
-wsl/start-gateway.sh       WSL 里用的第二个实例(端口 8791)
+wsl/start-gateway.sh       WSL loopback 网关（默认端口 8790）
 wsl/stop-gateway.sh        停掉它
 wsl/install-extension.sh   把扩展装进 WSL 的扩展宿主
 vscode-extension/          VS Code 接入(模型 provider + 独立面板)

@@ -2,7 +2,7 @@
 #
 # Stop the in-WSL workbuddy-gateway instance for one port.
 #
-#   bash wsl/stop-gateway.sh              # stops the instance on 8791
+#   bash wsl/stop-gateway.sh              # stops the instance on 8790
 #   bash wsl/stop-gateway.sh --port 8792  # stops the instance on 8792
 #   bash wsl/stop-gateway.sh --all        # stops every in-WSL instance
 #
@@ -20,7 +20,7 @@ set -uo pipefail
 STATE_DIR="${HOME}/.workbuddy-gateway-wsl"
 PID_FILE="${STATE_DIR}/gateway.pid"
 
-PORT="${WORKBUDDY_WSL_PORT:-8791}"
+PORT="${WORKBUDDY_WSL_PORT:-8790}"
 MODE="port"
 while [ $# -gt 0 ]; do
   case "$1" in

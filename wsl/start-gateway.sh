@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Start a workbuddy-gateway instance INSIDE WSL.
+# Start a loopback-only workbuddy-gateway INSIDE WSL.
 #
 # Why this exists
 # ---------------
@@ -10,9 +10,9 @@
 #   - mirrored networking (networkingMode=mirrored) needs Windows 11 22H2+
 #   - netsh portproxy needs administrator rights
 #
-# Instead this runs a second gateway instance inside WSL that reads the Windows
-# login state through /mnt/c. The Windows gateway keeps its 127.0.0.1 binding and
-# is never touched; VS Code in WSL connects to this instance on 127.0.0.1:8791.
+# This instance reads the Windows login state through /mnt/c. Windows can reach
+# WSL loopback via localhost forwarding when enabled. Stop any Windows gateway
+# on the same port first, so Windows clients reach the WSL instance instead.
 #
 # Usage:
 #   bash wsl/start-gateway.sh              # start (detached)
@@ -20,7 +20,7 @@
 #
 set -uo pipefail
 
-PORT="${WORKBUDDY_WSL_PORT:-8791}"
+PORT="${WORKBUDDY_WSL_PORT:-8790}"
 API_KEY="${WORKBUDDY_GATEWAY_API_KEY:-workbuddy-local}"
 STATE_DIR="${HOME}/.workbuddy-gateway-wsl"
 PID_FILE="${STATE_DIR}/gateway.pid"

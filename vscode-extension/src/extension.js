@@ -209,7 +209,7 @@ class ChatViewProvider {
         + 'machine cannot use mirrored networking (needs Windows 11) or portproxy (needs\n'
         + 'admin). Run a gateway inside WSL instead — it reads the Windows login through\n'
         + '/mnt/c, so the Windows gateway is left untouched:\n\n'
-        + '  bash /mnt/d/Project/WorkBuddyToDeepSeekHarness/wsl/start-gateway.sh\n\n'
+        + '  bash /path/to/WorkBuddyToDeepSeekHarness/wsl/start-gateway.sh\n\n'
         + 'That listens on http://127.0.0.1:' + WSL_LOCAL_PORT + ' inside this VM, which this\n'
         + 'extension probes automatically. Check it with:\n\n'
         + '  curl -s http://127.0.0.1:' + WSL_LOCAL_PORT + '/health';

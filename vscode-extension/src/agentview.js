@@ -344,7 +344,7 @@ class AgentViewProvider {
       if (err instanceof GatewayUnreachable) {
         message = isWsl()
           ? 'No gateway answered from WSL. Start one inside WSL:\n'
-            + 'bash /mnt/d/Project/WorkBuddyToDeepSeekHarness/wsl/start-gateway.sh\n'
+            + 'bash /path/to/WorkBuddyToDeepSeekHarness/wsl/start-gateway.sh\n'
             + '(it listens on 127.0.0.1:' + WSL_LOCAL_PORT + ')'
           : message;
       }
