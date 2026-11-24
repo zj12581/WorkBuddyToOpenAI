@@ -336,9 +336,32 @@ What that means in practice:
 |---|---|---|
 | `GET` | `/v1/models` | the configured model list, each tagged `tier: "free"` or `"paid"` |
 | `POST` | `/v1/chat/completions` | streaming and non-streaming, native `tools` / `tool_calls` |
+| `POST` | `/v1/responses` | the Responses protocol, translated to chat internally (see below) |
 | `GET` | `/health` | session state (identity fields redacted by default) |
 
 `/models` and `/chat/completions` also work without the `/v1` prefix, for clients that omit it.
+
+### The Responses endpoint
+
+The upstream speaks only `chat/completions`, but newer OpenAI clients default to
+the Responses API — and Codex CLI v0.171 removed chat support outright (its
+binary answers `` `wire_api = "chat"` is no longer supported ``). So
+`/v1/responses` is accepted here and translated to chat by
+[`lib/responses.js`](lib/responses.js):
+
+```
+client ──/v1/responses──► translate ──/v1/chat/completions──► upstream
+```
+
+Streaming and non-streaming both work, tools included. The translation has
+compromises worth knowing before pointing an agent at it:
+
+| Limitation | Why |
+|---|---|
+| Built-in tools are dropped | Codex sends `local_shell`, `web_search`, `computer_use` without a JSON Schema, and chat functions require one. The model never sees those tools, so the capability silently disappears. Each dropped name is logged. |
+| `previous_response_id` is ignored | Chat is stateless. Sending only the new turn would produce a request with no history. Codex sends full history by default, so this works in practice. |
+| `reasoning` input items are discarded | Chat has no equivalent field. |
+| Streaming is compressed in time | The answer is collected upstream first, so the retry ladder can still replace a blocked response, then replayed as Responses events. The client gets a valid sequence arriving at once rather than token-by-token. |
 
 ---
 

@@ -338,9 +338,27 @@ bash wsl/install-extension.sh # 把扩展装进 WSL 的扩展宿主
 |---|---|---|
 | `GET` | `/v1/models` | 已配置的模型清单,每项带 `tier: "free"` 或 `"paid"` |
 | `POST` | `/v1/chat/completions` | 流式 / 非流式,原生 `tools` / `tool_calls` |
+| `POST` | `/v1/responses` | Responses 协议,内部转译成 chat(见下) |
 | `GET` | `/health` | 会话状态(默认隐藏身份字段) |
 
 不带 `/v1` 前缀的 `/models`、`/chat/completions` 也接受,给会省略前缀的客户端用。
+
+### Responses 接口
+
+上游只有 `chat/completions`,但新版 OpenAI 客户端默认走 Responses 协议 —— Codex CLI 从 v0.171 起干脆移除了 chat 支持(它的二进制里写着 `` `wire_api = "chat"` is no longer supported ``)。所以这里接受 `/v1/responses`,由 [`lib/responses.js`](lib/responses.js) 转译成 chat:
+
+```
+客户端 ──/v1/responses──► 转译 ──/v1/chat/completions──► 上游
+```
+
+流式、非流式、工具调用都能用。但转译有代价,在把 agent 接上去之前值得知道:
+
+| 限制 | 原因 |
+|---|---|
+| 内置工具被丢弃 | Codex 会发 `local_shell`、`web_search`、`computer_use`,这些没有 JSON Schema,而 chat 的 function 必须有。模型看不到这些工具,能力静默消失。每个被丢弃的名字都会记进日志。 |
+| `previous_response_id` 被忽略 | Chat 无状态。只发增量那一轮会得到一个没有历史的请求。Codex 默认发完整历史,所以实际可用。 |
+| `reasoning` 输入条目被丢弃 | Chat 没有对应字段。 |
+| 流式是「一次性到达」 | 先在上游收完整个回答(这样重试机制还能替换被拦截的响应),再按 Responses 事件回放。客户端拿到的是合法序列,只是一次性到达而非逐字。 |
 
 ---
 

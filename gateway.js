@@ -41,6 +41,7 @@ const {
 } = require('./lib/core');
 const { Credential } = require('./lib/credentials');
 const catalog = require('./lib/catalog');
+const responses = require('./lib/responses');
 
 // ---------------------------------------------------------------------------
 // Configuration: defaults, then the config file, then CLI flags / environment
@@ -592,6 +593,192 @@ async function handleChat(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Responses API
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /v1/responses — the OpenAI Responses protocol.
+ *
+ * Neither the upstream nor this file's chat path speaks it, so requests are
+ * translated to chat (lib/responses.js), run through the same completeOnce()
+ * pipeline that already handles retries, desensitization and block detection,
+ * and the result is translated back.
+ *
+ * Streaming: the chat side buffers the whole answer before emitting anything, so
+ * relaying token-by-token would gain nothing — the deltas are replayed from the
+ * buffer the moment it is complete. The client sees a valid event sequence, just
+ * compressed in time. One code path for both modes, inheriting the retry ladder.
+ *
+ * Known gaps, both inherent to the chat protocol rather than fixable here:
+ *   - previous_response_id is ignored; each turn must carry the full input.
+ *   - reasoning items received in `input` are dropped.
+ */
+async function handleResponses(req, res) {
+  let payload;
+  try { payload = JSON.parse(await readBody(req)); }
+  catch (e) { return sendJson(res, 400, openaiError('bad json: ' + e.message, 'invalid_request_error', 400)); }
+
+  if (payload.input === undefined || payload.input === null) {
+    return sendJson(res, 400, openaiError('input is required', 'invalid_request_error', 400));
+  }
+
+  const model = payload.model || 'auto';
+  const t0 = Date.now();
+  const wantStream = payload.stream !== false;
+
+  // Built-in tools have no JSON Schema and cannot be expressed as chat
+  // functions. Name the ones dropped so a missing capability is legible in the
+  // log instead of showing up later as "the model ignored my tool".
+  const skippedTools = [];
+  const chatPayload = responses.toChatBody(payload, (t) => skippedTools.push(t));
+  if (skippedTools.length) {
+    log('responses | dropped built-in tool(s) with no chat equivalent: ' + skippedTools.join(', '));
+  }
+  if (!chatPayload.messages.length) {
+    return sendJson(res, 400, openaiError('input produced no messages', 'invalid_request_error', 400));
+  }
+
+  if (modelTier(model) === 'paid' && !warnedPaid.has(model)) {
+    warnedPaid.add(model);
+    log('paid model in use | model=' + model
+      + ' - billed per request. Free alternatives: hy4-preview-f / auto / deepseek-v4-flash');
+  }
+
+  const ctx = {
+    uid: (() => { try { return String(credential.account().uid || ''); } catch { return ''; } })(),
+    sessionId: sessionIdFromHeaders(req.headers),
+  };
+
+  // Collect upstream rather than stream: a half-emitted answer cannot be
+  // replaced by the retry ladder, and the chat path already buffers anyway.
+  chatPayload.stream = false;
+
+  let out;
+  try { out = await completeOnce(chatPayload, ctx); }
+  catch (e) { return sendJson(res, 502, openaiError('upstream unreachable: ' + e.message, 'upstream_error', 502)); }
+
+  if (!out.ok) {
+    log('responses | upstream failed | model=' + model + ' | HTTP ' + out.status
+      + ' | ' + String(out.text).slice(0, 200).replace(/\s+/g, ' '));
+    return sendJson(res, out.status, openaiError(String(out.text).slice(0, 500), 'upstream_error', out.status));
+  }
+
+  const chatResult = out.result;
+  const response = responses.toResponse(chatResult, model);
+  const uu = chatResult.usage || {};
+
+  if (!wantStream) {
+    log('responses | model=' + model + ' | non-stream | ' + (Date.now() - t0) + 'ms'
+      + ' | output_items=' + response.output.length
+      + ' | tokens=' + uu.total_tokens
+      + ' | credit=' + (uu.credit === undefined ? '?' : uu.credit));
+    return sendJson(res, 200, response);
+  }
+
+  // --- streaming: replay the buffered answer as Responses events ---
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  const created = Object.assign({}, response, { status: 'in_progress', output: [], output_text: '' });
+  responses.sseEvent(res, 'response.created', { type: 'response.created', response: created });
+
+  const text = response.output_text || '';
+  const hasMessage = response.output.some((o) => o.type === 'message');
+  const msgId = responses.newId('msg');
+
+  if (hasMessage || text) {
+    responses.sseEvent(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { type: 'message', id: msgId, status: 'in_progress', role: 'assistant', content: [] },
+    });
+    responses.sseEvent(res, 'response.content_part.added', {
+      type: 'response.content_part.added',
+      item_id: msgId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: '', annotations: [] },
+    });
+    if (text) {
+      responses.sseEvent(res, 'response.output_text.delta', {
+        type: 'response.output_text.delta',
+        item_id: msgId,
+        output_index: 0,
+        content_index: 0,
+        delta: text,
+      });
+    }
+    responses.sseEvent(res, 'response.output_text.done', {
+      type: 'response.output_text.done',
+      item_id: msgId,
+      output_index: 0,
+      content_index: 0,
+      text,
+    });
+    responses.sseEvent(res, 'response.content_part.done', {
+      type: 'response.content_part.done',
+      item_id: msgId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text, annotations: [] },
+    });
+    responses.sseEvent(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: {
+        type: 'message',
+        id: msgId,
+        status: 'completed',
+        role: 'assistant',
+        content: [{ type: 'output_text', text, annotations: [] }],
+      },
+    });
+  }
+
+  // Tool calls are separate top-level output items, following the message.
+  let idx = hasMessage ? 1 : 0;
+  for (const item of response.output) {
+    if (item.type !== 'function_call') continue;
+    responses.sseEvent(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: idx,
+      item: Object.assign({}, item, { status: 'in_progress', arguments: '' }),
+    });
+    responses.sseEvent(res, 'response.function_call_arguments.delta', {
+      type: 'response.function_call_arguments.delta',
+      item_id: item.id,
+      output_index: idx,
+      delta: item.arguments,
+    });
+    responses.sseEvent(res, 'response.function_call_arguments.done', {
+      type: 'response.function_call_arguments.done',
+      item_id: item.id,
+      output_index: idx,
+      arguments: item.arguments,
+    });
+    responses.sseEvent(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: idx,
+      item,
+    });
+    idx++;
+  }
+
+  responses.sseEvent(res, 'response.completed', { type: 'response.completed', response });
+  res.end();
+
+  log('responses | model=' + model + ' | stream | ' + (Date.now() - t0) + 'ms'
+    + ' | output_items=' + response.output.length
+    + ' | tokens=' + uu.total_tokens
+    + ' | credit=' + (uu.credit === undefined ? '?' : uu.credit));
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
@@ -650,6 +837,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions')) {
       if (!checkAuth(req)) return sendJson(res, 401, openaiError('invalid api key', 'auth_error', 401));
       return await handleChat(req, res);
+    }
+
+    // Responses protocol, translated to chat internally. Present because Codex
+    // CLI v0.171+ removed chat support outright, and other newer OpenAI clients
+    // default to it.
+    if (req.method === 'POST' && (url.pathname === '/v1/responses' || url.pathname === '/responses')) {
+      if (!checkAuth(req)) return sendJson(res, 401, openaiError('invalid api key', 'auth_error', 401));
+      return await handleResponses(req, res);
     }
 
     sendJson(res, 404, openaiError('no such route: ' + url.pathname, 'invalid_request_error', 404));
